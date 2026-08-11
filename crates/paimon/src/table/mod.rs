@@ -28,6 +28,7 @@ mod bucket_assigner_dynamic;
 mod bucket_assigner_fixed;
 mod bucket_filter;
 mod bucket_function;
+pub(crate) mod commit_callback;
 mod commit_message;
 pub(crate) mod cow_writer;
 mod data_evolution_reader;
@@ -67,6 +68,7 @@ mod write_builder;
 use crate::Result;
 use arrow_array::RecordBatch;
 pub use branch_manager::BranchManager;
+pub use commit_callback::CommitCallback;
 pub use commit_message::CommitMessage;
 pub use cow_writer::{CopyOnWriteMergeWriter, FileInfo};
 pub use data_evolution_writer::DataEvolutionWriter;
@@ -255,6 +257,49 @@ impl Table {
             table.travel_snapshot = Some(snapshot);
         }
         Ok(table)
+    }
+
+    /// Create a copy of this table that reads the latest snapshot of the named
+    /// branch.
+    ///
+    /// Branch data files are shared with the main table; only snapshot and
+    /// schema files are copied at branch-creation time. `location` therefore
+    /// stays unchanged so manifest and data-file paths resolve correctly via
+    /// the main table root. Only snapshot and schema resolution use the branch
+    /// path.
+    ///
+    /// Returns an error if the branch does not exist or has no snapshots.
+    pub async fn copy_with_branch(&self, branch_name: &str) -> crate::Result<Self> {
+        let branch_sm = SnapshotManager::new(self.file_io.clone(), self.location.clone())
+            .with_branch(branch_name);
+        let snapshot_id = branch_sm
+            .get_latest_snapshot_id()
+            .await?
+            .ok_or_else(|| crate::Error::DataInvalid {
+                message: format!("branch '{branch_name}' not found or has no snapshots"),
+                source: None,
+            })?;
+        let snapshot = branch_sm.get_snapshot(snapshot_id).await?;
+        let schema = if snapshot.schema_id() != self.schema.id() {
+            let branch_schema = self
+                .schema_manager
+                .with_branch(branch_name)
+                .schema(snapshot.schema_id())
+                .await?;
+            branch_schema.copy_with_replaced_options(self.schema.options().clone())
+        } else {
+            self.schema.clone()
+        };
+        Ok(Self {
+            file_io: self.file_io.clone(),
+            identifier: self.identifier.clone(),
+            location: self.location.clone(),
+            schema,
+            schema_manager: self.schema_manager.clone(),
+            rest_env: self.rest_env.clone(),
+            time_traveled: true,
+            travel_snapshot: Some(snapshot),
+        })
     }
 
     /// Whether this table copy reads a historical snapshot with its

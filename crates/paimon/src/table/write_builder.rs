@@ -30,6 +30,7 @@ pub struct WriteBuilder<'a> {
     table: &'a Table,
     commit_user: String,
     overwrite: bool,
+    branch: Option<String>,
 }
 
 impl<'a> WriteBuilder<'a> {
@@ -38,6 +39,7 @@ impl<'a> WriteBuilder<'a> {
             table,
             commit_user: Uuid::new_v4().to_string(),
             overwrite: false,
+            branch: None,
         }
     }
 
@@ -70,9 +72,26 @@ impl<'a> WriteBuilder<'a> {
         self
     }
 
+    /// Route snapshot commits to a named branch instead of the main table.
+    ///
+    /// Data files are still written to the main table location (branches share
+    /// data). Only the snapshot landing path is redirected. The branch must
+    /// already exist before the first commit (create it with
+    /// [`BranchManager::create_branch`]).
+    ///
+    /// Mirrors Java `table.switchToBranch(name).newCommit(user)`.
+    pub fn with_branch(mut self, branch_name: impl Into<String>) -> Self {
+        self.branch = Some(branch_name.into());
+        self
+    }
+
     /// Create a new TableCommit for committing write results.
     pub fn new_commit(&self) -> TableCommit {
-        TableCommit::new(self.table.clone(), self.commit_user.clone())
+        if let Some(ref branch) = self.branch {
+            TableCommit::new_for_branch(self.table.clone(), self.commit_user.clone(), branch)
+        } else {
+            TableCommit::new(self.table.clone(), self.commit_user.clone())
+        }
     }
 
     /// Create a new TableWrite for writing Arrow data.
