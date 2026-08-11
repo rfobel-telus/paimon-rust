@@ -30,6 +30,7 @@ pub mod btree;
 pub mod catalog;
 mod deletion_vector;
 pub mod file_index;
+pub mod iceberg;
 pub mod io;
 pub mod lumina;
 mod predicate_stats;
