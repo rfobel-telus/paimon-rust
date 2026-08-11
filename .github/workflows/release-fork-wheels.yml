@@ -1,0 +1,140 @@
+# Build multi-platform wheels for this experimental fork and publish them as
+# GitHub Release assets — NOT to PyPI/TestPyPI. Kept off any package registry
+# on purpose, so it can't be resolved as a production dependency by accident.
+#
+# Adapted from upstream apache/paimon-rust's release_python_binding.yml — the
+# sdist/wheels build matrix is copied as-is (including the manylinux OpenSSL
+# workarounds); only the trigger and publish step differ.
+#
+# Trigger: manual only. Run it from whichever branch has the features you
+# want to hand out, e.g.:
+#   gh workflow run release-fork-wheels.yml --ref agent/1y4-iceberg-changelog-commit-callback
+
+name: Release Fork Wheels (GitHub Release, not PyPI)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (leave blank to auto-generate from date + short SHA)"
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          command: sdist
+          args: -o dist
+          before-script-linux: |
+            sudo apt-get update && sudo apt-get install -y libssl-dev
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-sdist
+          path: bindings/python/dist
+
+  wheels:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest }
+          - { os: macos-15-intel, target: "x86_64-apple-darwin" }
+          - { os: macos-latest, target: "aarch64-apple-darwin" }
+          - { os: ubuntu-latest, target: "x86_64" }
+          - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          command: build
+          args: --release -o dist
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          before-script-linux: |
+            # Install OpenSSL for x86_64 (manylinux2014 with OpenSSL 1.1)
+            if [ "${{ matrix.target }}" = "x86_64" ]; then
+              yum install -y openssl11-devel
+              ln -sf /usr/lib64/pkgconfig/openssl11.pc /usr/lib64/pkgconfig/openssl.pc
+              ln -sf /usr/lib64/pkgconfig/libssl11.pc /usr/lib64/pkgconfig/libssl.pc
+              ln -sf /usr/lib64/pkgconfig/libcrypto11.pc /usr/lib64/pkgconfig/libcrypto.pc
+            fi
+
+            # Install precompiled OpenSSL from Debian packages for aarch64
+            if [ "${{ matrix.target }}" = "aarch64" ]; then
+              set -e
+              (cd /tmp
+              DEBIAN_MIRROR="http://ftp.debian.org/debian/pool/main/o/openssl"
+              curl -sLO "${DEBIAN_MIRROR}/libssl1.1_1.1.1w-0+deb11u1_arm64.deb"
+              curl -sLO "${DEBIAN_MIRROR}/libssl-dev_1.1.1w-0+deb11u1_arm64.deb"
+              for deb in *.deb; do
+                ar x "$deb"
+                tar xf data.tar.*
+                rm -f debian-binary control.tar.* data.tar.*
+              done
+              TARGET_DIR="/usr/aarch64-unknown-linux-gnu"
+              mkdir -p "${TARGET_DIR}/include/openssl" "${TARGET_DIR}/lib"
+              cp -r usr/include/openssl/* "${TARGET_DIR}/include/openssl/"
+              cp -f usr/include/aarch64-linux-gnu/openssl/configuration.h "${TARGET_DIR}/include/openssl/" || true
+              cp -f usr/include/aarch64-linux-gnu/openssl/opensslconf.h "${TARGET_DIR}/include/openssl/" || true
+              cp -a usr/lib/aarch64-linux-gnu/libssl* "${TARGET_DIR}/lib/"
+              cp -a usr/lib/aarch64-linux-gnu/libcrypto* "${TARGET_DIR}/lib/"
+              )
+              export CFLAGS_aarch64_unknown_linux_gnu="-D__ARM_ARCH=8"
+            fi
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target || 'native' }}
+          path: bindings/python/dist
+
+  release:
+    name: Publish wheels to a GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs: [sdist, wheels]
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Compute release tag
+        id: tag
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=wheels-$(date +%Y%m%d)-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release and upload wheels
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.tag.outputs.tag }}" dist/*.whl dist/*.tar.gz \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.tag.outputs.tag }}" \
+            --notes "Experimental wheels built from ${{ github.ref_name }} @ $(git rev-parse --short HEAD). Not published to PyPI — install directly with: pip install <asset-url>" \
+            --prerelease
