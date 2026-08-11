@@ -52,14 +52,11 @@ jobs:
     strategy:
       matrix:
         include:
-          # TEMP: narrowed to macOS ARM64 only to validate the workflow cheaply
-          # before paying for the full 5-platform matrix. Uncomment the rest
-          # once a macOS wheel builds, installs, and smoke-tests cleanly.
-          # - { os: windows-latest }
-          # - { os: macos-15-intel, target: "x86_64-apple-darwin" }
+          - { os: windows-latest }
+          - { os: macos-15-intel, target: "x86_64-apple-darwin" }
           - { os: macos-latest, target: "aarch64-apple-darwin" }
-          # - { os: ubuntu-latest, target: "x86_64" }
-          # - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
+          - { os: ubuntu-latest, target: "x86_64" }
+          - { os: ubuntu-latest, target: "aarch64", manylinux: "manylinux_2_28" }
     steps:
       - uses: actions/checkout@v6
 
