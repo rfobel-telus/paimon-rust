@@ -79,6 +79,7 @@ const DEFAULT_DYNAMIC_BUCKET_TARGET_ROW_NUM: i64 = 200_000;
 const DEFAULT_GLOBAL_INDEX_ROW_COUNT_PER_SHARD: i64 = 100_000;
 const BLOB_AS_DESCRIPTOR_OPTION: &str = "blob-as-descriptor";
 const BLOB_DESCRIPTOR_FIELD_OPTION: &str = "blob-descriptor-field";
+const METADATA_ICEBERG_CHANGELOG_STORAGE_OPTION: &str = "metadata.iceberg.changelog.storage";
 
 /// Merge engine for primary-key tables.
 ///
@@ -153,6 +154,39 @@ pub(crate) fn first_row_supports_changelog_producer(producer: ChangelogProducer)
         producer,
         ChangelogProducer::None | ChangelogProducer::Lookup
     )
+}
+
+/// Where (if anywhere) to write the companion Iceberg changelog table.
+///
+/// Reference: Java `IcebergOptions.METADATA_ICEBERG_CHANGELOG_STORAGE`
+/// (`metadata.iceberg.changelog.storage`). Java's enum spans several catalog
+/// storage backends (table-location / hadoop-catalog / hive-catalog /
+/// rest-catalog); this Rust port only recognizes the storage backends this
+/// fork actually implements today (see `crates/paimon/src/io/storage_fs.rs`
+/// and `storage_gcs.rs`), so the value space is intentionally narrower.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IcebergChangelogStorage {
+    /// Do not produce a companion Iceberg changelog table (default).
+    Disabled,
+    /// Write the companion table's metadata using local filesystem storage.
+    Local,
+    /// Write the companion table's metadata to Google Cloud Storage.
+    Gcs,
+}
+
+impl IcebergChangelogStorage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Local => "local",
+            Self::Gcs => "gcs",
+        }
+    }
+
+    /// Whether the changelog companion table should be produced at all.
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
 }
 
 /// Format the bucket directory name for a given bucket number.
@@ -606,6 +640,27 @@ impl<'a> CoreOptions<'a> {
             .map(|s| s.split(',').map(|f| f.trim().to_string()).collect())
             .unwrap_or_default()
     }
+
+    /// Typed `metadata.iceberg.changelog.storage` setting. Default is `Disabled`.
+    ///
+    /// Gates whether an [`IcebergChangelogCommitCallback`](crate::iceberg::IcebergChangelogCommitCallback)
+    /// should be attached to a table's commits (alongside `changelog-producer`
+    /// producing an actual changelog to mirror).
+    pub fn try_iceberg_changelog_storage(&self) -> crate::Result<IcebergChangelogStorage> {
+        match self.options.get(METADATA_ICEBERG_CHANGELOG_STORAGE_OPTION) {
+            None => Ok(IcebergChangelogStorage::Disabled),
+            Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+                "" | "disabled" | "none" | "false" => Ok(IcebergChangelogStorage::Disabled),
+                "local" | "table-location" | "fs" | "filesystem" => {
+                    Ok(IcebergChangelogStorage::Local)
+                }
+                "gcs" | "gs" => Ok(IcebergChangelogStorage::Gcs),
+                other => Err(crate::Error::Unsupported {
+                    message: format!("Unsupported metadata.iceberg.changelog.storage: '{other}'"),
+                }),
+            },
+        }
+    }
 }
 
 /// Parse a memory size string to bytes using binary (1024-based) semantics.
@@ -840,6 +895,61 @@ mod tests {
             .expect_err("unknown producer should fail");
         assert!(
             matches!(err, crate::Error::Unsupported { message } if message.contains("Unsupported changelog-producer"))
+        );
+    }
+
+    #[test]
+    fn test_iceberg_changelog_storage_defaults_to_disabled() {
+        let options = HashMap::new();
+        let core = CoreOptions::new(&options);
+
+        let storage = core.try_iceberg_changelog_storage().unwrap();
+        assert_eq!(storage, IcebergChangelogStorage::Disabled);
+        assert!(!storage.is_enabled());
+    }
+
+    #[test]
+    fn test_iceberg_changelog_storage_accepts_known_values() {
+        for (value, expected) in [
+            ("disabled", IcebergChangelogStorage::Disabled),
+            ("none", IcebergChangelogStorage::Disabled),
+            ("local", IcebergChangelogStorage::Local),
+            ("table-location", IcebergChangelogStorage::Local),
+            ("gcs", IcebergChangelogStorage::Gcs),
+            ("GCS", IcebergChangelogStorage::Gcs),
+            ("gs", IcebergChangelogStorage::Gcs),
+        ] {
+            let options = HashMap::from([(
+                METADATA_ICEBERG_CHANGELOG_STORAGE_OPTION.to_string(),
+                value.into(),
+            )]);
+            let core = CoreOptions::new(&options);
+
+            assert_eq!(core.try_iceberg_changelog_storage().unwrap(), expected);
+        }
+        let enabled_options = HashMap::from([(
+            METADATA_ICEBERG_CHANGELOG_STORAGE_OPTION.to_string(),
+            "local".to_string(),
+        )]);
+        assert!(CoreOptions::new(&enabled_options)
+            .try_iceberg_changelog_storage()
+            .unwrap()
+            .is_enabled());
+    }
+
+    #[test]
+    fn test_iceberg_changelog_storage_rejects_unknown_values() {
+        let options = HashMap::from([(
+            METADATA_ICEBERG_CHANGELOG_STORAGE_OPTION.to_string(),
+            "s3".to_string(),
+        )]);
+        let core = CoreOptions::new(&options);
+
+        let err = core
+            .try_iceberg_changelog_storage()
+            .expect_err("unknown storage should fail");
+        assert!(
+            matches!(err, crate::Error::Unsupported { message } if message.contains("Unsupported metadata.iceberg.changelog.storage"))
         );
     }
 

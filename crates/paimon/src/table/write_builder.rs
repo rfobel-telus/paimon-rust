@@ -19,7 +19,10 @@
 //!
 //! Reference: [pypaimon WriteBuilder](https://github.com/apache/paimon/blob/master/paimon-python/pypaimon/write/write_builder.py)
 
-use crate::table::{Table, TableCommit, TableUpdate, TableWrite};
+use crate::iceberg::IcebergChangelogCommitCallback;
+use crate::spec::CoreOptions;
+use crate::table::{CommitCallback, Table, TableCommit, TableUpdate, TableWrite};
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Builder for creating table writers and committers.
@@ -86,12 +89,50 @@ impl<'a> WriteBuilder<'a> {
     }
 
     /// Create a new TableCommit for committing write results.
+    ///
+    /// Automatically attaches an [`IcebergChangelogCommitCallback`] (see
+    /// [`Self::commit_callbacks`]) when `metadata.iceberg.changelog.storage`
+    /// is set on the table, so a table with e.g. `changelog-producer=lookup`
+    /// + `metadata.iceberg.changelog.storage=local` gets a companion Iceberg
+    /// changelog table written on every commit without any extra caller code.
     pub fn new_commit(&self) -> TableCommit {
-        if let Some(ref branch) = self.branch {
+        let callbacks = self.commit_callbacks();
+        let commit = if let Some(ref branch) = self.branch {
             TableCommit::new_for_branch(self.table.clone(), self.commit_user.clone(), branch)
         } else {
             TableCommit::new(self.table.clone(), self.commit_user.clone())
+        };
+        if callbacks.is_empty() {
+            commit
+        } else {
+            commit.with_commit_callbacks(callbacks)
         }
+    }
+
+    /// Build the list of [`CommitCallback`]s that should be attached to a
+    /// commit for this table, derived from table options.
+    ///
+    /// Currently only covers `metadata.iceberg.changelog.storage`
+    /// (`Disabled`/`Local`/`Gcs` — see
+    /// [`CoreOptions::try_iceberg_changelog_storage`]); an unrecognized value
+    /// is treated as "no callback" here rather than failing commit
+    /// construction; callers that want strict validation should call
+    /// `try_iceberg_changelog_storage()` themselves ahead of time.
+    fn commit_callbacks(&self) -> Vec<Arc<dyn CommitCallback>> {
+        let mut callbacks: Vec<Arc<dyn CommitCallback>> = Vec::new();
+
+        let storage = CoreOptions::new(self.table.schema().options())
+            .try_iceberg_changelog_storage()
+            .unwrap_or(crate::spec::IcebergChangelogStorage::Disabled);
+        if storage.is_enabled() {
+            callbacks.push(Arc::new(IcebergChangelogCommitCallback::new(
+                self.table.file_io().clone(),
+                self.table.location().to_string(),
+                self.table.schema().clone(),
+            )));
+        }
+
+        callbacks
     }
 
     /// Create a new TableWrite for writing Arrow data.
@@ -362,6 +403,172 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(snapshot.commit_kind(), &CommitKind::APPEND);
+    }
+
+    // ── IcebergChangelogCommitCallback auto-wiring ───────────────────────────
+    //
+    // These mirror `paimon-rust` commit `981942d`'s
+    // `test_iceberg_changelog_auto_trigger_on_commit` /
+    // `test_iceberg_changelog_not_triggered_without_option`, but drive the
+    // callback through `WriteBuilder::new_commit()`'s option-gated
+    // `with_commit_callbacks` wiring rather than the inline, error-swallowing
+    // path that commit hardcoded into `TableCommit::try_commit_once`.
+
+    fn iceberg_changelog_input_pk_table(file_io: &FileIO, table_path: &str) -> Table {
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("changelog-producer", "input")
+            .option("metadata.iceberg.changelog.storage", "local")
+            .build()
+            .unwrap();
+        Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_iceberg_changelog_input"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_new_commit_auto_attaches_iceberg_changelog_callback_when_option_set() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_iceberg_changelog_auto_attach";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = iceberg_changelog_input_pk_table(&file_io, table_path);
+        let wb = table.new_write_builder();
+        let mut write = wb.new_write().unwrap();
+        // A duplicate key within one batch forces a merge, which under
+        // changelog-producer=input still emits the raw input rows as a
+        // changelog file (see `test_input_changelog_writes_raw_rows_separately_from_data_rows`
+        // in table_write.rs).
+        write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(
+            messages[0].new_changelog_files.len(),
+            1,
+            "expected changelog-producer=input to emit a changelog file"
+        );
+
+        wb.new_commit().commit(messages).await.unwrap();
+
+        let snapshot_manager =
+            crate::table::SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let snapshot = snapshot_manager
+            .get_latest_snapshot()
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            snapshot.changelog_manifest_list().is_some(),
+            "snapshot should carry a changelog_manifest_list"
+        );
+
+        let meta_path = format!(
+            "{table_path}_changelog/metadata/v{}.metadata.json",
+            snapshot.id()
+        );
+        assert!(
+            file_io
+                .new_input(&meta_path)
+                .unwrap()
+                .exists()
+                .await
+                .unwrap(),
+            "expected companion Iceberg metadata.json to be auto-written to {meta_path}"
+        );
+        let hint_path = format!("{table_path}_changelog/metadata/version-hint.text");
+        assert!(
+            file_io
+                .new_input(&hint_path)
+                .unwrap()
+                .exists()
+                .await
+                .unwrap(),
+            "expected version-hint.text to be auto-written to {hint_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_commit_does_not_attach_iceberg_changelog_callback_by_default() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_iceberg_changelog_not_attached";
+        setup_dirs(&file_io, table_path).await;
+
+        // Same table shape, but without metadata.iceberg.changelog.storage set.
+        let table = input_changelog_pk_table(&file_io, table_path);
+        let wb = table.new_write_builder();
+        let mut write = wb.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+        assert_eq!(
+            messages[0].new_changelog_files.len(),
+            1,
+            "expected changelog-producer=input to emit a changelog file"
+        );
+
+        wb.new_commit().commit(messages).await.unwrap();
+
+        let meta_dir_exists = file_io
+            .exists(&format!("{table_path}_changelog/metadata/"))
+            .await
+            .unwrap();
+        assert!(
+            !meta_dir_exists,
+            "companion Iceberg directory must not be created without the option set"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_commit_does_not_attach_iceberg_changelog_callback_when_disabled() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_iceberg_changelog_explicitly_disabled";
+        setup_dirs(&file_io, table_path).await;
+
+        let schema = Schema::builder()
+            .column("id", DataType::Int(IntType::new()))
+            .column("value", DataType::Int(IntType::new()))
+            .primary_key(["id"])
+            .option("bucket", "1")
+            .option("changelog-producer", "input")
+            .option("metadata.iceberg.changelog.storage", "disabled")
+            .build()
+            .unwrap();
+        let table = Table::new(
+            file_io.clone(),
+            Identifier::new("default", "test_iceberg_changelog_disabled"),
+            table_path.to_string(),
+            TableSchema::new(0, &schema),
+            None,
+        );
+        let wb = table.new_write_builder();
+        let mut write = wb.new_write().unwrap();
+        write
+            .write_arrow_batch(&make_batch(vec![1], vec![10]))
+            .await
+            .unwrap();
+        let messages = write.prepare_commit().await.unwrap();
+
+        wb.new_commit().commit(messages).await.unwrap();
+
+        let meta_dir_exists = file_io
+            .exists(&format!("{table_path}_changelog/metadata/"))
+            .await
+            .unwrap();
+        assert!(
+            !meta_dir_exists,
+            "companion Iceberg directory must not be created when explicitly disabled"
+        );
     }
 
     #[test]
