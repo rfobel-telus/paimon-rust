@@ -29,6 +29,7 @@ use crate::spec::{
     IndexManifestEntry, Manifest, ManifestEntry, ManifestFileMeta, ManifestList, PartitionComputer,
     PartitionStatistics, Predicate, Snapshot, EMPTY_SERIALIZED_ROW, MANIFEST_ENTRY_SCHEMA,
 };
+use crate::table::commit_callback::CommitCallback;
 use crate::table::commit_message::CommitMessage;
 use crate::table::partition_filter::PartitionFilter;
 use crate::table::snapshot_commit::SnapshotCommit;
@@ -54,7 +55,14 @@ type ExistingRowIdRanges = HashMap<PartitionBucketKey, Vec<RowIdRange>>;
 pub struct TableCommit {
     table: Table,
     snapshot_manager: SnapshotManager,
+    /// Always the main table manifest directory, even for branch commits.
+    /// Branches share data files and manifests with the main table; only
+    /// snapshot metadata lives under the branch path.
+    manifest_dir: String,
     snapshot_commit: Arc<dyn SnapshotCommit>,
+    /// Hooks invoked once per successful logical commit. Empty by default —
+    /// attach with [`TableCommit::with_commit_callbacks`].
+    commit_callbacks: Vec<Arc<dyn CommitCallback>>,
     commit_user: String,
     total_buckets: i32,
     // commit config
@@ -73,6 +81,7 @@ pub struct TableCommit {
 impl TableCommit {
     pub fn new(table: Table, commit_user: String) -> Self {
         let snapshot_manager = SnapshotManager::new(table.file_io.clone(), table.location.clone());
+        let manifest_dir = snapshot_manager.manifest_dir();
         let snapshot_commit = if let Some(env) = &table.rest_env {
             env.snapshot_commit()
         } else {
@@ -95,7 +104,9 @@ impl TableCommit {
         Self {
             table,
             snapshot_manager,
+            manifest_dir,
             snapshot_commit,
+            commit_callbacks: Vec::new(),
             commit_user,
             total_buckets,
             commit_max_retries,
@@ -109,6 +120,74 @@ impl TableCommit {
             data_evolution_enabled,
             partition_default_name,
         }
+    }
+
+    /// Create a commit that writes snapshots to a named branch instead of the
+    /// main table.
+    ///
+    /// Data files and manifests are still written to the main table location
+    /// (branches share data with the main table). Only the snapshot commit is
+    /// routed to `{table_root}/branch/branch-{branch_name}/snapshot/`.
+    ///
+    /// The branch directory must already exist (create it with
+    /// [`BranchManager::create_branch`] before calling this).
+    ///
+    /// Mirrors Java `AbstractFileStoreTable.switchToBranch(name)` →
+    /// `newCommit(user)`.
+    pub fn new_for_branch(table: Table, commit_user: String, branch_name: &str) -> Self {
+        let main_sm = SnapshotManager::new(table.file_io.clone(), table.location.clone());
+        let manifest_dir = main_sm.manifest_dir();
+        let branch_sm = main_sm.with_branch(branch_name);
+        let snapshot_commit = if let Some(env) = &table.rest_env {
+            env.snapshot_commit()
+        } else {
+            Arc::new(crate::table::snapshot_commit::RenamingSnapshotCommit::new(
+                branch_sm.clone(),
+            ))
+        };
+        let core_options = CoreOptions::new(table.schema().options());
+        let total_buckets = core_options.bucket();
+        let commit_max_retries = core_options.commit_max_retries();
+        let commit_timeout_ms = core_options.commit_timeout_ms();
+        let commit_min_retry_wait_ms = core_options.commit_min_retry_wait_ms();
+        let commit_max_retry_wait_ms = core_options.commit_max_retry_wait_ms();
+        let manifest_compression = core_options.manifest_compression().to_string();
+        let manifest_target_size = core_options.manifest_target_size();
+        let manifest_merge_min_count = core_options.manifest_merge_min_count();
+        let row_tracking_enabled = core_options.row_tracking_enabled();
+        let data_evolution_enabled = core_options.data_evolution_enabled();
+        let partition_default_name = core_options.partition_default_name().to_string();
+        Self {
+            table,
+            snapshot_manager: branch_sm,
+            manifest_dir,
+            snapshot_commit,
+            commit_callbacks: Vec::new(),
+            commit_user,
+            total_buckets,
+            commit_max_retries,
+            commit_timeout_ms,
+            commit_min_retry_wait_ms,
+            commit_max_retry_wait_ms,
+            manifest_compression,
+            manifest_target_size,
+            manifest_merge_min_count,
+            row_tracking_enabled,
+            data_evolution_enabled,
+            partition_default_name,
+        }
+    }
+
+    /// Attach hooks to be invoked once per successful logical commit.
+    ///
+    /// Mirrors Java `AbstractFileStore.createCommitCallbacks()` — the
+    /// natural call site is wherever a `TableCommit` is constructed for
+    /// production use (e.g. `WriteBuilder::new_commit`), passing in
+    /// callbacks derived from table options (e.g. an Iceberg metadata
+    /// writer gated on `metadata.iceberg.storage`).
+    pub fn with_commit_callbacks(mut self, callbacks: Vec<Arc<dyn CommitCallback>>) -> Self {
+        self.commit_callbacks = callbacks;
+        self
     }
 
     /// Commit new files in APPEND mode.
@@ -608,7 +687,12 @@ impl TableCommit {
                 .await?;
 
             match result {
-                CommitAttemptResult::Success => break,
+                CommitAttemptResult::Success(snapshot) => {
+                    for callback in &self.commit_callbacks {
+                        callback.call(&snapshot).await?;
+                    }
+                    break;
+                }
                 CommitAttemptResult::Retry(state) => {
                     duplicate_check_start_snapshot_id.get_or_insert_with(|| {
                         latest_snapshot.as_ref().map(|s| s.id() + 1).unwrap_or(1)
@@ -670,7 +754,7 @@ impl TableCommit {
         }
 
         let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let manifest_dir = self.manifest_dir.clone();
 
         let unique_id = uuid::Uuid::new_v4();
         let base_manifest_list_name = format!("manifest-list-{unique_id}-0");
@@ -795,7 +879,7 @@ impl TableCommit {
         let statistics = self.generate_partition_statistics(&resolved.entries)?;
 
         if self.snapshot_commit.commit(&snapshot, &statistics).await? {
-            Ok(CommitAttemptResult::Success)
+            Ok(CommitAttemptResult::Success(Box::new(snapshot)))
         } else {
             Ok(CommitAttemptResult::Retry(Box::new(RetryState {
                 latest_snapshot: latest_snapshot.clone(),
@@ -1079,7 +1163,7 @@ impl TableCommit {
         retry_state: Option<&RetryState>,
     ) -> Result<ResolvedCommit> {
         let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let manifest_dir = self.manifest_dir.clone();
 
         match plan {
             CommitEntriesPlan::Direct {
@@ -1557,7 +1641,7 @@ impl TableCommit {
             return Ok(vec![]);
         };
         let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let manifest_dir = self.manifest_dir.clone();
         let mut entries = Vec::new();
         for manifest_list in [snap.base_manifest_list(), snap.delta_manifest_list()] {
             let manifest_list_path = format!("{manifest_dir}/{manifest_list}");
@@ -1593,7 +1677,7 @@ impl TableCommit {
         snapshot: &Snapshot,
     ) -> Result<Vec<ManifestEntry>> {
         let file_io = self.snapshot_manager.file_io();
-        let manifest_dir = self.snapshot_manager.manifest_dir();
+        let manifest_dir = self.manifest_dir.clone();
         let delta_path = format!("{manifest_dir}/{}", snapshot.delta_manifest_list());
         let manifest_files = ManifestList::read(file_io, &delta_path).await?;
         let mut entries = Vec::new();
@@ -2540,7 +2624,7 @@ struct ResolvedCommit {
 }
 
 enum CommitAttemptResult {
-    Success,
+    Success(Box<Snapshot>),
     Retry(Box<RetryState>),
 }
 
@@ -2707,7 +2791,9 @@ mod tests {
     use crate::spec::{
         BinaryRowBuilder, DataFileMeta, GlobalIndexMeta, IndexFileMeta, ManifestList, TableSchema,
     };
+    use async_trait::async_trait;
     use chrono::{DateTime, Utc};
+    use std::sync::Mutex;
 
     fn test_file_io() -> FileIO {
         FileIOBuilder::new("memory").build().unwrap()
@@ -3058,6 +3144,122 @@ mod tests {
         assert_eq!(snapshot.id(), 2);
         assert_eq!(snapshot.total_record_count(), Some(300));
         assert_eq!(snapshot.delta_record_count(), Some(200));
+    }
+
+    struct RecordingCallback {
+        snapshot_ids: Mutex<Vec<i64>>,
+    }
+
+    impl RecordingCallback {
+        fn new() -> Self {
+            Self {
+                snapshot_ids: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CommitCallback for RecordingCallback {
+        async fn call(&self, snapshot: &Snapshot) -> Result<()> {
+            self.snapshot_ids.lock().unwrap().push(snapshot.id());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_callback_invoked_once_per_commit() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_callback_invoked";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let callback = Arc::new(RecordingCallback::new());
+        let commit = TableCommit::new(table, "test-user".to_string())
+            .with_commit_callbacks(vec![callback.clone() as Arc<dyn CommitCallback>]);
+
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+        assert_eq!(*callback.snapshot_ids.lock().unwrap(), vec![1]);
+
+        // A second, independent `commit()` call fires the callback again,
+        // exactly once — not accumulated internal-retry noise.
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-1.parquet", 50)],
+            )])
+            .await
+            .unwrap();
+        assert_eq!(*callback.snapshot_ids.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn test_commit_without_callbacks_is_unaffected() {
+        // No callbacks attached (the default) — commit succeeds exactly as
+        // before this mechanism existed.
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_no_callbacks";
+        setup_dirs(&file_io, table_path).await;
+
+        let commit = setup_commit(&file_io, table_path);
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        assert!(snap_manager.get_latest_snapshot().await.unwrap().is_some());
+    }
+
+    struct FailingCallback;
+
+    #[async_trait]
+    impl CommitCallback for FailingCallback {
+        async fn call(&self, _snapshot: &Snapshot) -> Result<()> {
+            Err(crate::Error::DataInvalid {
+                message: "callback failed".to_string(),
+                source: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_commit_callback_error_fails_commit() {
+        // Documents the deliberate fail-fast default: a callback error
+        // propagates out of `commit()` rather than being logged and
+        // swallowed (see docs/paimon-rust-commit-callback-scoping.md).
+        let file_io = test_file_io();
+        let table_path = "memory:/test_commit_callback_error";
+        setup_dirs(&file_io, table_path).await;
+
+        let table = test_table(&file_io, table_path);
+        let commit = TableCommit::new(table, "test-user".to_string())
+            .with_commit_callbacks(vec![Arc::new(FailingCallback)]);
+
+        let result = commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await;
+        assert!(result.is_err());
+
+        // The snapshot itself was already durably committed before the
+        // callback ran — a callback failure does not roll back the commit.
+        let snap_manager = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        assert!(snap_manager.get_latest_snapshot().await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -4830,5 +5032,216 @@ mod tests {
         assert_eq!(metas[0].max_bucket(), Some(3));
         assert_eq!(metas[0].min_level(), Some(0));
         assert_eq!(metas[0].max_level(), Some(2));
+    }
+
+    // ── Branch write tests ────────────────────────────────────────────────────
+    //
+    // Port of Java SimpleTableTestBase.testFastForward() and related branch
+    // write assertions. The invariant under test: a branch commit writes the
+    // snapshot to the branch snapshot directory and leaves the main table's
+    // snapshot directory untouched. Data files and manifests always land in
+    // the main table root (branches share data).
+
+    /// Create the branch snapshot directory so the commit can write there.
+    async fn setup_branch_dirs(file_io: &FileIO, table_path: &str, branch_name: &str) {
+        let branch_snap_dir =
+            format!("{table_path}/branch/branch-{branch_name}/snapshot/");
+        file_io.mkdirs(&branch_snap_dir).await.unwrap();
+    }
+
+    /// Branch snapshot lands in `{table}/branch/branch-{name}/snapshot/` and
+    /// the main snapshot directory stays empty.
+    ///
+    /// Mirrors Java: `table.switchToBranch("b").newCommit(user).commit(...)` →
+    /// assert main snapshot count unchanged, branch snapshot count +1.
+    #[tokio::test]
+    async fn test_branch_commit_snapshot_goes_to_branch_path() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_branch_commit_snapshot_path";
+        setup_dirs(&file_io, table_path).await;
+        setup_branch_dirs(&file_io, table_path, "test-branch").await;
+
+        let commit = TableCommit::new_for_branch(
+            test_table(&file_io, table_path),
+            "test-user".to_string(),
+            "test-branch",
+        );
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let branch_sm = SnapshotManager::new(file_io.clone(), table_path.to_string())
+            .with_branch("test-branch");
+        let snapshot = branch_sm.get_latest_snapshot().await.unwrap();
+        assert!(snapshot.is_some(), "branch snapshot should exist after commit");
+        assert_eq!(snapshot.unwrap().id(), 1);
+    }
+
+    /// The main table's snapshot directory must remain untouched after a
+    /// branch commit.
+    ///
+    /// Mirrors Java assertion in testFastForward: before fast-forward the
+    /// main-branch table still returns its original snapshot count.
+    #[tokio::test]
+    async fn test_branch_commit_main_table_unaffected() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_branch_commit_main_unaffected";
+        setup_dirs(&file_io, table_path).await;
+        setup_branch_dirs(&file_io, table_path, "test-branch").await;
+
+        let commit = TableCommit::new_for_branch(
+            test_table(&file_io, table_path),
+            "test-user".to_string(),
+            "test-branch",
+        );
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 100)],
+            )])
+            .await
+            .unwrap();
+
+        let main_sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        let main_snapshot = main_sm.get_latest_snapshot().await.unwrap();
+        assert!(
+            main_snapshot.is_none(),
+            "main table snapshot must remain empty after a branch commit"
+        );
+    }
+
+    /// Sequential branch commits must increment the branch snapshot id, just
+    /// as sequential main-branch commits would.
+    #[tokio::test]
+    async fn test_branch_commit_increments_snapshot_id() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_branch_commit_sequential";
+        setup_dirs(&file_io, table_path).await;
+        setup_branch_dirs(&file_io, table_path, "test-branch").await;
+
+        let commit = TableCommit::new_for_branch(
+            test_table(&file_io, table_path),
+            "test-user".to_string(),
+            "test-branch",
+        );
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 10)],
+            )])
+            .await
+            .unwrap();
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-1.parquet", 20)],
+            )])
+            .await
+            .unwrap();
+
+        let branch_sm = SnapshotManager::new(file_io.clone(), table_path.to_string())
+            .with_branch("test-branch");
+        let snapshot = branch_sm.get_latest_snapshot().await.unwrap().unwrap();
+        assert_eq!(
+            snapshot.id(),
+            2,
+            "second branch commit should produce snapshot id 2"
+        );
+        assert_eq!(snapshot.total_record_count(), Some(30));
+    }
+
+    /// `WriteBuilder::with_branch` must route the commit to the named branch
+    /// while leaving the main table untouched. This mirrors the Java pattern:
+    ///
+    /// ```java
+    /// FileStoreTable tableBranch = table.switchToBranch("branch1");
+    /// tableBranch.newWrite(user).write(...);
+    /// tableBranch.newCommit(user).commit(1, ...);
+    /// // assert: table.snapshotManager().latestSnapshotId() unchanged
+    /// // assert: tableBranch.snapshotManager().latestSnapshotId() == 1
+    /// ```
+    #[tokio::test]
+    async fn test_write_builder_with_branch_routes_commit_to_branch() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_write_builder_branch";
+        setup_dirs(&file_io, table_path).await;
+        setup_branch_dirs(&file_io, table_path, "feat-branch").await;
+
+        let table = test_table(&file_io, table_path);
+        let commit = table
+            .new_write_builder()
+            .with_commit_user("test-user")
+            .unwrap()
+            .with_branch("feat-branch")
+            .new_commit();
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-0.parquet", 50)],
+            )])
+            .await
+            .unwrap();
+
+        // Branch has snapshot 1
+        let branch_sm = SnapshotManager::new(file_io.clone(), table_path.to_string())
+            .with_branch("feat-branch");
+        let branch_snap = branch_sm.get_latest_snapshot().await.unwrap();
+        assert!(branch_snap.is_some(), "branch snapshot should exist");
+        assert_eq!(branch_snap.unwrap().id(), 1);
+
+        // Main table has no snapshot
+        let main_sm = SnapshotManager::new(file_io.clone(), table_path.to_string());
+        assert!(
+            main_sm.get_latest_snapshot().await.unwrap().is_none(),
+            "main table must remain empty after branch commit"
+        );
+    }
+
+    /// Data files referenced by branch snapshots live in the main table root,
+    /// not under the branch directory. Confirmed by checking that the manifest
+    /// recorded in the branch snapshot resolves against the main manifest dir.
+    #[tokio::test]
+    async fn test_branch_commit_manifests_at_main_location() {
+        let file_io = test_file_io();
+        let table_path = "memory:/test_branch_commit_manifests";
+        setup_dirs(&file_io, table_path).await;
+        setup_branch_dirs(&file_io, table_path, "test-branch").await;
+
+        let commit = TableCommit::new_for_branch(
+            test_table(&file_io, table_path),
+            "test-user".to_string(),
+            "test-branch",
+        );
+        commit
+            .commit(vec![CommitMessage::new(
+                vec![],
+                0,
+                vec![test_data_file("data-main.parquet", 77)],
+            )])
+            .await
+            .unwrap();
+
+        let branch_sm = SnapshotManager::new(file_io.clone(), table_path.to_string())
+            .with_branch("test-branch");
+        let snapshot = branch_sm.get_latest_snapshot().await.unwrap().unwrap();
+
+        // The manifest list name must be resolvable from the MAIN manifest dir
+        let main_manifest_dir = format!("{table_path}/manifest");
+        let delta_list_path =
+            format!("{main_manifest_dir}/{}", snapshot.delta_manifest_list());
+        let exists = file_io.exists(&delta_list_path).await.unwrap();
+        assert!(
+            exists,
+            "branch snapshot's manifest list should be in the main table manifest dir: {delta_list_path}"
+        );
     }
 }

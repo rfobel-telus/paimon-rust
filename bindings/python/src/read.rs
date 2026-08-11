@@ -33,6 +33,7 @@ pub struct PyReadBuilder {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    branch: Option<String>,
 }
 
 impl PyReadBuilder {
@@ -42,6 +43,7 @@ impl PyReadBuilder {
             projection: None,
             limit: None,
             filter: None,
+            branch: None,
         }
     }
 }
@@ -71,12 +73,18 @@ impl PyReadBuilder {
         Ok(slf)
     }
 
+    fn with_branch(mut slf: PyRefMut<'_, Self>, branch_name: String) -> PyRefMut<'_, Self> {
+        slf.branch = Some(branch_name);
+        slf
+    }
+
     fn new_scan(&self) -> PyTableScan {
         PyTableScan {
             table: Arc::clone(&self.table),
             projection: self.projection.clone(),
             limit: self.limit,
             filter: self.filter.clone(),
+            branch: self.branch.clone(),
         }
     }
 }
@@ -87,6 +95,7 @@ pub struct PyTableScan {
     projection: Option<Vec<String>>,
     limit: Option<usize>,
     filter: Option<Predicate>,
+    branch: Option<String>,
 }
 
 #[pymethods]
@@ -95,7 +104,14 @@ impl PyTableScan {
         let rt = runtime();
         let splits = py.detach(|| {
             rt.block_on(async {
-                let mut builder = self.table.new_read_builder();
+                let branched;
+                let effective: &Table = if let Some(ref name) = self.branch {
+                    branched = self.table.copy_with_branch(name).await.map_err(to_py_err)?;
+                    &branched
+                } else {
+                    &self.table
+                };
+                let mut builder = effective.new_read_builder();
                 if let Some(projection) = &self.projection {
                     let cols: Vec<&str> = projection.iter().map(String::as_str).collect();
                     builder.with_projection(&cols);

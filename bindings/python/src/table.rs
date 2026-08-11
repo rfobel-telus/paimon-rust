@@ -17,10 +17,13 @@
 
 use std::sync::Arc;
 
+use paimon::table::BranchManager;
 use pyo3::prelude::*;
 
+use crate::branch::PyBranchManager;
 use crate::read::PyReadBuilder;
 use crate::schema::PyTableSchema;
+use crate::write::PyWriteBuilder;
 
 #[pyclass(name = "Table", module = "pypaimon_rust.datafusion")]
 pub struct PyTable {
@@ -51,5 +54,19 @@ impl PyTable {
     /// Create a [`PyReadBuilder`] for DataFrame-style scan planning.
     fn new_read_builder(&self) -> PyReadBuilder {
         PyReadBuilder::new(Arc::clone(&self.inner))
+    }
+
+    /// Create a [`PyWriteBuilder`] for writing Arrow batches and committing snapshots.
+    fn new_write_builder(&self) -> PyWriteBuilder {
+        PyWriteBuilder::new(Arc::clone(&self.inner))
+    }
+
+    /// Return a [`PyBranchManager`] for creating, listing, and dropping branches.
+    fn branch_manager(&self) -> PyBranchManager {
+        let bm = BranchManager::new(
+            self.inner.file_io().clone(),
+            self.inner.location().to_string(),
+        );
+        PyBranchManager::new(bm)
     }
 }
